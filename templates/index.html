@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ShushDRAC</title>
+<style>
+  :root{--bg:#111418;--card:#1b2027;--fg:#e6e9ee;--mut:#8a94a3;--acc:#3b82f6;--bad:#ef4444;--ok:#22c55e;--line:#2b323c}
+  *{box-sizing:border-box}body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+  main{max-width:1000px;margin:auto;padding:16px;display:grid;gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+  h1{font-size:20px;margin:0}h2{font-size:15px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+  input,select,button{font:inherit;padding:7px 10px;border-radius:6px;border:1px solid var(--line);background:#0e1115;color:var(--fg)}
+  button{background:var(--acc);border:0;cursor:pointer}button.sec{background:#2b323c}button.bad{background:var(--bad)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+  .stat{background:#0e1115;border-radius:6px;padding:8px}.stat b{display:block;font-size:18px}.stat span{color:var(--mut);font-size:12px}
+  .prof{display:flex;justify-content:space-between;align-items:center;padding:8px;border:1px solid var(--line);border-radius:6px}
+  .prof.active{border-color:var(--ok)}
+  canvas{width:100%;height:260px;background:#0e1115;border-radius:6px;cursor:crosshair;touch-action:none}
+  #msg{min-height:1.2em}.err{color:var(--bad)}.okc{color:var(--ok)}
+  pre{margin:0;max-height:160px;overflow:auto;color:var(--mut);font-size:12px}
+  table td{padding:2px 6px}
+</style>
+</head>
+<body><main>
+  <div class="row" style="justify-content:space-between"><h1>ShushDRAC <span style="color:var(--mut);font-size:13px;font-weight:400">PowerEdge fan control · iDRAC IPMI</span></h1><div id="mode" class="row"></div></div>
+
+  <section class="card"><h2>Connection</h2>
+    <div class="row">
+      <input id="host" placeholder="iDRAC IP" size="16">
+      <input id="user" placeholder="user" value="root" size="10">
+      <input id="pass" type="password" placeholder="password" size="14">
+      <button onclick="connect()">Connect</button>
+      <label class="row"><input type="checkbox" id="autoref" checked> auto-refresh</label>
+    </div>
+    <div id="msg"></div>
+  </section>
+
+  <section class="card"><h2>Sensors</h2><div id="sensors" class="grid"><span style="color:var(--mut)">Not connected</span></div></section>
+
+  <section class="card"><h2>Profiles</h2>
+    <div id="profiles" style="display:grid;gap:6px"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="sec" onclick="goAuto()">Return to iDRAC Auto</button>
+      <button class="sec" onclick="pcie(false)">Disable 3rd-party PCIe cooling boost</button>
+      <button class="sec" onclick="pcie(true)">Re-enable PCIe boost</button>
+    </div>
+  </section>
+
+  <section class="card"><h2>Profile editor</h2>
+    <div class="row">
+      <input id="pname" placeholder="profile name" value="My curve">
+      <select id="ptype" onchange="renderEditor()"><option value="curve">Temperature curve</option><option value="static">Fixed speed</option></select>
+    </div>
+    <div id="staticEd" class="row" style="margin-top:10px">
+      Speed <input type="range" id="sspeed" min="0" max="100" value="25" oninput="sval.textContent=this.value+'%'"> <b id="sval">25%</b>
+    </div>
+    <div id="curveEd" style="margin-top:10px">
+      <canvas id="cv" width="900" height="260"></canvas>
+      <div style="color:var(--mut);font-size:12px;margin:4px 0">Drag points · click empty space to add · right-click a point to remove. X = hottest CPU °C, Y = fan %.</div>
+      <table id="ptable"></table>
+      <div class="row" style="margin-top:8px">
+        Poll every <input id="interval" type="number" value="10" min="3" style="width:60px">s
+        Hysteresis <input id="hyst" type="number" value="2" min="0" style="width:60px">°C
+        Failsafe → auto at <input id="fsafe" type="number" value="80" min="40" max="95" style="width:60px">°C
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button onclick="saveProfile()">Save</button>
+      <button class="sec" onclick="applyEditor()">Apply now (without saving)</button>
+    </div>
+  </section>
+
+  <section class="card"><h2>Log</h2><pre id="log"></pre></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let profiles={}, active=null, pts=[[30,12],[45,18],[55,28],[65,45],[72,70],[78,100]], curTemp=null;
+const T0=20,T1=90;
+
+async function api(path,body,method){
+  const r=await fetch(path,{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+  return r.json();
+}
+function msg(t,bad){const m=$('msg');m.textContent=t;m.className=bad?'err':'okc'}
+
+async function connect(){
+  msg('Connecting…');
+  const r=await api('/api/connect',{host:$('host').value,user:$('user').value,password:$('pass').value});
+  if(!r.ok) return msg(r.error,true);
+  try{localStorage.setItem('idrac',JSON.stringify({host:$('host').value,user:$('user').value}))}catch{}
+  msg('Connected'); refresh();
+}
+async function refresh(){
+  const r=await api('/api/status');
+  active=r.profile;
+  $('mode').innerHTML=`<span class="stat"><span>mode</span> <b style="display:inline;font-size:14px">${r.mode}${r.speed!=null?' · '+r.speed+'%':''}${r.profile?' · '+esc(r.profile):''}</b></span>`;
+  $('log').textContent=(r.log||[]).join('\n');
+  if(r.ok){
+    const s=$('sensors');s.innerHTML='';
+    const cpu=Object.entries(r.temps).filter(([k])=>!/inlet|exhaust/i.test(k)).map(([,v])=>v);
+    curTemp=cpu.length?Math.max(...cpu):null;
+    for(const[k,v] of Object.entries(r.temps)) s.insertAdjacentHTML('beforeend',`<div class="stat"><span>${esc(k)}</span><b>${v}°C</b></div>`);
+    for(const[k,v] of Object.entries(r.fans)) s.insertAdjacentHTML('beforeend',`<div class="stat"><span>${esc(k)}</span><b>${v} rpm</b></div>`);
+    draw();
+  } else if(r.error && !/No iDRAC host/.test(r.error)) msg(r.error,true);
+  renderProfiles();
+}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+async function loadProfiles(){profiles=(await api('/api/profiles')).profiles;renderProfiles()}
+function renderProfiles(){
+  const el=$('profiles');el.innerHTML='';
+  for(const[n,p] of Object.entries(profiles)){
+    const d=document.createElement('div');d.className='prof'+(n===active?' active':'');
+    d.innerHTML=`<span><b>${esc(n)}</b> <span style="color:var(--mut)">${p.type==='static'?p.speed+'% fixed':'curve, '+p.points.length+' pts, failsafe '+p.failsafe_temp+'°C'}</span></span>`;
+    const b=document.createElement('div');b.className='row';
+    const mk=(t,c,f)=>{const x=document.createElement('button');x.textContent=t;if(c)x.className=c;x.onclick=f;b.append(x)};
+    mk('Apply','',()=>apply(n));mk('Edit','sec',()=>edit(n));mk('✕','bad',()=>del(n));
+    d.append(b);el.append(d);
+  }
+}
+async function apply(name,profile){
+  const r=await api('/api/apply',{name,profile});
+  r.ok?msg('Applied '+name):msg(r.error,true);refresh();
+}
+async function goAuto(){const r=await api('/api/auto',{});r.ok?msg('iDRAC auto control restored'):msg(r.error,true);refresh()}
+async function pcie(en){const r=await api('/api/pcie',{enable:en});r.ok?msg('Done'):msg(r.error,true);refresh()}
+async function del(n){if(!confirm('Delete '+n+'?'))return;profiles=(await api('/api/profiles/'+encodeURIComponent(n),null,'DELETE')).profiles;renderProfiles()}
+function edit(n){
+  const p=profiles[n];$('pname').value=n;$('ptype').value=p.type;
+  if(p.type==='static'){$('sspeed').value=p.speed;$('sval').textContent=p.speed+'%'}
+  else{pts=p.points.map(x=>[...x]);$('interval').value=p.interval||10;$('hyst').value=p.hysteresis??2;$('fsafe').value=p.failsafe_temp||80}
+  renderEditor();
+}
+function editorProfile(){
+  return $('ptype').value==='static'?{type:'static',speed:+$('sspeed').value}
+    :{type:'curve',points:[...pts].sort((a,b)=>a[0]-b[0]),interval:+$('interval').value,hysteresis:+$('hyst').value,failsafe_temp:+$('fsafe').value};
+}
+async function saveProfile(){
+  const r=await api('/api/profiles',{name:$('pname').value,profile:editorProfile()});
+  if(!r.ok)return msg(r.error,true);profiles=r.profiles;renderProfiles();msg('Saved');
+}
+function applyEditor(){apply($('pname').value,editorProfile())}
+function renderEditor(){const c=$('ptype').value==='curve';$('curveEd').style.display=c?'':'none';$('staticEd').style.display=c?'none':'';draw()}
+
+// ---- curve canvas
+const cv=$('cv'),ctx=cv.getContext('2d'),PAD=36;
+const W=()=>cv.width-PAD*2,H=()=>cv.height-PAD*2;
+const tx=t=>PAD+(t-T0)/(T1-T0)*W(), sy=s=>PAD+H()-s/100*H();
+const xt=x=>Math.round(T0+(x-PAD)/W()*(T1-T0)), ys=y=>Math.round((PAD+H()-y)/H()*100);
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);ctx.font='11px system-ui';
+  ctx.strokeStyle='#2b323c';ctx.fillStyle='#8a94a3';
+  for(let t=T0;t<=T1;t+=10){ctx.beginPath();ctx.moveTo(tx(t),PAD);ctx.lineTo(tx(t),PAD+H());ctx.stroke();ctx.fillText(t+'°',tx(t)-8,cv.height-12)}
+  for(let s=0;s<=100;s+=20){ctx.beginPath();ctx.moveTo(PAD,sy(s));ctx.lineTo(PAD+W(),sy(s));ctx.stroke();ctx.fillText(s+'%',4,sy(s)+4)}
+  const fs=+$('fsafe').value;ctx.fillStyle='rgba(239,68,68,.12)';ctx.fillRect(tx(fs),PAD,tx(T1)-tx(fs),H());
+  if(curTemp!=null){ctx.strokeStyle='#22c55e';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(tx(curTemp),PAD);ctx.lineTo(tx(curTemp),PAD+H());ctx.stroke();ctx.setLineDash([])}
+  const s=[...pts].sort((a,b)=>a[0]-b[0]);
+  ctx.strokeStyle='#3b82f6';ctx.lineWidth=2;ctx.beginPath();
+  ctx.moveTo(tx(T0),sy(s[0][1]));s.forEach(p=>ctx.lineTo(tx(p[0]),sy(p[1])));ctx.lineTo(tx(T1),sy(s.at(-1)[1]));ctx.stroke();ctx.lineWidth=1;
+  ctx.fillStyle='#e6e9ee';s.forEach(p=>{ctx.beginPath();ctx.arc(tx(p[0]),sy(p[1]),6,0,7);ctx.fill()});
+  $('ptable').innerHTML='<tr>'+s.map(p=>`<td>${p[0]}°C→${p[1]}%</td>`).join('')+'</tr>';
+}
+function pos(e){const r=cv.getBoundingClientRect();return[(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height]}
+function hit(x,y){return pts.findIndex(p=>Math.hypot(tx(p[0])-x,sy(p[1])-y)<12)}
+let drag=-1;
+cv.onpointerdown=e=>{if(e.button!==0)return;const[x,y]=pos(e);drag=hit(x,y);
+  if(drag<0){pts.push([clampT(xt(x)),clamp(ys(y))]);drag=pts.length-1}cv.setPointerCapture(e.pointerId);draw()};
+cv.onpointermove=e=>{if(drag<0)return;const[x,y]=pos(e);pts[drag]=[clampT(xt(x)),clamp(ys(y))];draw()};
+cv.onpointerup=()=>drag=-1;
+cv.oncontextmenu=e=>{e.preventDefault();const i=hit(...pos(e));if(i>=0&&pts.length>2){pts.splice(i,1);draw()}};
+const clamp=v=>Math.max(0,Math.min(100,v)), clampT=v=>Math.max(T0,Math.min(T1,v));
+$('fsafe').oninput=draw;
+
+try{const s=JSON.parse(localStorage.getItem('idrac')||'{}');if(s.host)$('host').value=s.host;if(s.user)$('user').value=s.user}catch{}
+loadProfiles();renderEditor();refresh();
+setInterval(()=>{if($('autoref').checked)refresh()},10000);
+</script>
+</body></html>
